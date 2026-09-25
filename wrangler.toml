@@ -1,0 +1,14 @@
+name = "tarjimcall-signaling"
+main = "src/worker.js"
+compatibility_date = "2025-04-01"
+
+# One hub Durable Object holds every live WebSocket, every room and the
+# number -> {token,name} registry, so relay + push work on the free plan
+# without any computer running at home.
+[[durable_objects]]
+binding = "HUB"
+class_name = "Hub"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["Hub"]

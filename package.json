@@ -1,0 +1,6 @@
+{
+  "name": "tarjimcall-signaling-worker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Free serverless signaling + FCM push for TarjimCall (Cloudflare Workers)"
+}
