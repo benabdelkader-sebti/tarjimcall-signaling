@@ -2,11 +2,11 @@
 //
 // Speaks EXACTLY the same WebSocket protocol as the home Node server, so the
 // Android app needs no protocol change:
-//   client -> server: register{number,name,token} | login{number}
+//   client -> server: register{number,name,token} | login{number} | search{query}
 //                     | call{from,to} | join{room} | <relayed anything>
 //   server -> client: registered | register-failed | login-ok | login-unknown
-//                     | call-ringing | call-unavailable | call-failed
-//                     | joined{peers} | peer-joined | <relayed anything>
+//                     | search-results{results} | call-ringing | call-unavailable
+//                     | call-failed | joined{peers} | peer-joined | <relayed>
 //
 // All live state (sockets, rooms, registry) lives in ONE Durable Object so
 // both phones always meet in the same place, and the registry survives
@@ -168,6 +168,26 @@ export class Hub {
       const entry = this.entryFor(number);
       if (!entry) return this.send(ws, { type: 'login-unknown', number });
       return this.send(ws, { type: 'login-ok', number, name: entry.name || '' });
+    }
+
+    // --- contact directory search: find registered users by name or number --
+    // Any connected client may query the shared registry (this IS the contact
+    // directory feature). Matches are substring, case-insensitive; capped at 25
+    // so a one-letter query cannot dump the whole registry in one frame.
+    if (msg.type === 'search') {
+      const query = String(msg.query || '').trim().toLowerCase();
+      await this.loadRegistry();
+      if (!query) return this.send(ws, { type: 'search-results', query, results: [] });
+      const results = [];
+      for (const number of this.registry.keys()) {
+        const entry = this.entryFor(number);
+        const name = (entry && entry.name) ? String(entry.name) : '';
+        if (name.toLowerCase().includes(query) || String(number).includes(query)) {
+          results.push({ number: String(number), name });
+          if (results.length >= 25) break;
+        }
+      }
+      return this.send(ws, { type: 'search-results', query, results });
     }
 
     // --- call request: wake the callee by number via FCM ------------------
