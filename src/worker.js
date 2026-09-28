@@ -304,10 +304,13 @@ export class Hub {
         body: JSON.stringify({
           message: {
             token,
+            // "from"/"to" are reserved FCM envelope keys: putting them inside
+            // data makes messages:send reject the payload with 400
+            // INVALID_ARGUMENT "Invalid data payload key: from".
             data: {
               type: 'call-invite',
-              from: String(from || ''),
-              to: String(to || ''),
+              caller: String(from || ''),
+              callee: String(to || ''),
               name: String(fromName || ''),
               ts: String(Date.now()),
             },
