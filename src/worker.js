@@ -190,6 +190,54 @@ export class Hub {
       return this.send(ws, { type: 'search-results', query, results });
     }
 
+    // --- contact matching: which of these numbers already have an account? ---
+    // The app normalizes each address-book number on-device and sends the digit
+    // list; we return only the subset present in the registry. Exact match
+    // first, then a last-9-digits fallback (a contact may be stored in a
+    // different local/international form than the owner registered). Response
+    // is capped so a huge address book cannot blow up one frame.
+    if (msg.type === 'match') {
+      await this.loadRegistry();
+      const digitsOf = (s) => String(s || '').replace(/\D/g, '');
+      const bySuffix = new Map();
+      for (const number of this.registry.keys()) {
+        const d = digitsOf(number);
+        if (d.length >= 9) {
+          const entry = this.entryFor(number);
+          bySuffix.set(d.slice(-9), {
+            number: String(number),
+            name: (entry && entry.name) ? String(entry.name) : '',
+          });
+        }
+      }
+      const incoming = Array.isArray(msg.numbers) ? msg.numbers : [];
+      const seen = new Set();
+      const results = [];
+      for (const raw of incoming) {
+        const number = String(raw || '').trim();
+        if (!number) continue;
+        let hitNumber = null;
+        let hitName = '';
+        const exact = this.entryFor(number);
+        if (exact) {
+          hitNumber = number;
+          hitName = exact.name ? String(exact.name) : '';
+        } else {
+          const d = digitsOf(number);
+          if (d.length >= 9) {
+            const s = bySuffix.get(d.slice(-9));
+            if (s) { hitNumber = s.number; hitName = s.name; }
+          }
+        }
+        if (hitNumber && !seen.has(hitNumber)) {
+          seen.add(hitNumber);
+          results.push({ number: hitNumber, name: hitName });
+          if (results.length >= 500) break;
+        }
+      }
+      return this.send(ws, { type: 'match-results', results });
+    }
+
     // --- call request: wake the callee by number via FCM ------------------
     if (msg.type === 'call') {
       const from = String(msg.from || '').trim();
