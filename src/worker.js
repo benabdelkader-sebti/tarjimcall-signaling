@@ -289,6 +289,24 @@ export class Hub {
       return;
     }
 
+    // --- server-side translation fallback ---------------------------------
+    // On-device ML Kit models cannot download on some networks (or on
+    // devices without Play services). The call socket is already connected
+    // here, so translate server-side and answer on the same socket: the
+    // call keeps translating on ANY network, no phone setup required.
+    if (msg.type === 'translate-req') {
+      const text = String(msg.text || '').slice(0, 2000);
+      const from = String(msg.from || 'auto');
+      const to = String(msg.to || 'en');
+      const rid = String(msg.rid || '');
+      if (!text.trim()) {
+        return this.send(ws, { type: 'translate-res', rid, ok: false, text: '' });
+      }
+      const out = await cloudTranslate(text, from, to);
+      console.log(`TRANSLATE ${from}->${to} rid=${rid} ok=${!!out}`);
+      return this.send(ws, { type: 'translate-res', rid, ok: !!out, text: out || '' });
+    }
+
     // --- everything else is relayed inside the room -----------------------
     if (meta.room) this.broadcast(meta.room, ws, msg);
   }
@@ -370,4 +388,45 @@ export class Hub {
     if (!res.ok) throw new Error(`FCM send failed: ${res.status} ${await res.text()}`);
     return true;
   }
+}
+
+// Server-side translation for phones that cannot run ML Kit on-device
+// (model download blocked by the network, no Play services, ...). Tries
+// Google's public translate endpoint first, then the free MyMemory API.
+async function cloudTranslate(text, from, to) {
+  try {
+    const url =
+      'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t' +
+      '&sl=' + encodeURIComponent(from) +
+      '&tl=' + encodeURIComponent(to) +
+      '&q=' + encodeURIComponent(text);
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 14)' },
+    });
+    if (res.ok) {
+      const j = await res.json();
+      const segs = Array.isArray(j) && Array.isArray(j[0]) ? j[0] : [];
+      const out = segs
+        .map((s) => (Array.isArray(s) ? s[0] : ''))
+        .filter(Boolean)
+        .join('');
+      if (out.trim()) return out;
+    }
+  } catch (e) {
+    console.error('cloudTranslate gtx failed', e && e.message);
+  }
+  try {
+    const res = await fetch(
+      'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) +
+        '&langpair=' + encodeURIComponent(from + '|' + to)
+    );
+    if (res.ok) {
+      const j = await res.json();
+      const out = j && j.responseData && j.responseData.translatedText;
+      if (typeof out === 'string' && out.trim()) return out;
+    }
+  } catch (e) {
+    console.error('cloudTranslate mymemory failed', e && e.message);
+  }
+  return '';
 }
