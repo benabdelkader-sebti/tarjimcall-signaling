@@ -1,23 +1,54 @@
+const PRIVACY_POLICY_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TarjimCall Privacy Policy</title><style>body{font-family:system-ui,sans-serif;max-width:850px;margin:40px auto;padding:0 20px;line-height:1.7}h1,h2{color:#00796b}.ar{direction:rtl;text-align:right}</style></head><body>
+<h1>TarjimCall — Privacy Policy</h1>
+<p><strong>Effective date: 2026-10-05</strong></p>
+<h2>English</h2>
+<p>TarjimCall processes speech on the user's device using Android Speech Recognition and translates it on-device with Google ML Kit. During a call, recognized text is encrypted end-to-end with an ephemeral per-call key before it is relayed between the two participants. The signaling relay does not receive plaintext conversation text and does not store translated messages.</p>
+<p>The service may process your phone number, optional display name and Firebase Cloud Messaging token to register the account, find users and deliver incoming-call notifications. Optional contact matching sends normalized phone-number digits for membership matching.</p>
+<p>We do not sell conversation data. Crash reports are stored locally unless the user explicitly exports them. Account data is retained while needed for call routing and may be deleted on request.</p>
+<p>Service providers include Google Firebase Cloud Messaging, Google ML Kit, Android Speech Recognition and Cloudflare Workers.</p>
+<p>Contact: <a href="mailto:benabdelkader506@gmail.com">benabdelkader506@gmail.com</a></p>
+<hr>
+<div class="ar" lang="ar"><h2>سياسة الخصوصية</h2>
+<p>يعالج TarjimCall الكلام على جهاز المستخدم باستخدام التعرف على الكلام في Android، وتتم الترجمة محلياً باستخدام Google ML Kit. أثناء المكالمة يتم تشفير النص المتعرّف عليه من طرف إلى طرف بمفتاح مؤقت خاص بالمكالمة قبل تمريره بين الطرفين. وسيط الإشارات لا يستقبل نص المحادثة بصيغته الواضحة ولا يخزن الرسائل المترجمة.</p>
+<p>قد نعالج رقم الهاتف والاسم الاختياري ورمز Firebase لإدارة الحسابات والعثور على المستخدمين وإيصال إشعارات المكالمات الواردة. ميزة مطابقة جهات الاتصال الاختيارية ترسل أرقام الهواتف المطبّعة فقط للمطابقة.</p>
+<p>لا نبيع بيانات المحادثات. وتبقى تقارير الأعطال محلياً على الجهاز ما لم يقم المستخدم بتصديرها. تُحتفظ ببيانات الحساب طالما كانت لازمة لتوجيه المكالمات ويمكن طلب حذفها.</p>
+<p>للتواصل: <a href="mailto:benabdelkader506@gmail.com">benabdelkader506@gmail.com</a></p></div>
+</body></html>`;
+
 // TarjimCall signaling as a Cloudflare Worker (free serverless).
 //
-// Speaks EXACTLY the same WebSocket protocol as the home Node server, so the
-// Android app needs no protocol change:
+// Speaks the WebSocket protocol the Android app expects. Every extra field
+// (attempt, expiresAt, callee) is optional, so an older installed app build and
+// an older deployed Worker keep working together while either side updates.
 //   client -> server: register{number,name,token} | login{number} | search{query}
-//                     | call{from,to} | join{room} | <relayed anything>
+//                     | match{numbers} | call{from,to,attempt,expiresAt}
+//                     | call-cancel{attempt,to} | join{room} | <relayed anything>
 //   server -> client: registered | register-failed | login-ok | login-unknown
-//                     | search-results{results} | call-ringing | call-unavailable
-//                     | call-failed | joined{peers} | peer-joined | <relayed>
+//                     | search-results{results} | match-results{results}
+//                     | call-ringing{to,callee,attempt} | call-unavailable
+//                     | call-failed | call-cancel | joined{peers} | peer-joined
+//                     | <relayed>
 //
 // All live state (sockets, rooms, registry) lives in ONE Durable Object so
 // both phones always meet in the same place, and the registry survives
 // hibernation/restarts via DO storage. Incoming-call push goes straight to
 // FCM HTTP v1 (RS256 JWT signed with Web Crypto) — no firebase-admin needed.
 
+// Max time an incoming-call push may stay alive. The caller stops ringing at
+// 45s, so anything longer can only wake the callee for a dead call.
+const INVITE_MAX_LIFETIME_MS = 40000;
+
 export default {
   async fetch(request, env) {
     if (request.headers.get('Upgrade') === 'websocket') {
       const hub = env.HUB.get(env.HUB.idFromName('hub'));
       return hub.fetch(request);
+    }
+    if (request.method === 'GET' && new URL(request.url).pathname === '/privacy-policy') {
+      return new Response(PRIVACY_POLICY_HTML, {
+        headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'public, max-age=3600' }
+      });
     }
     if (new URL(request.url).pathname === '/health') {
       return json({ ok: true, service: 'tarjimcall-signaling' });
@@ -61,6 +92,7 @@ export class Hub {
     this.rooms = new Map();     // room key -> Set<WebSocket>
     this.meta = new Map();      // WebSocket -> { number, name, room }
     this.registry = new Map();  // number -> { token, name, ts }
+    this.pending = new Map();   // attempt id -> { to, expiresAt }
     this.registryReady = null;  // lazy load promise
     this.accessToken = null;    // { value, expiresAt }
   }
@@ -78,9 +110,11 @@ export class Hub {
     return this.registryReady;
   }
 
+  // Awaited by register() so the ack only reaches the phone once the token is
+  // durably stored; fire-and-forget callers just get a never-rejecting promise.
   persistRegistry() {
     const snapshot = Object.fromEntries(this.registry);
-    this.state.storage.put('registry', snapshot).catch(() => {});
+    return this.state.storage.put('registry', snapshot).catch(() => {});
   }
 
   entryFor(number) {
@@ -88,6 +122,39 @@ export class Hub {
     if (!v) return null;
     if (typeof v === 'string') return { token: v, name: '', ts: 0 };
     return v;
+  }
+
+  // A caller may dial the local form (0773…) while the callee registered the
+  // international one (213773…), because each phone canonicalizes with its own
+  // SIM country. Exact key first, then the same last-9-digits fallback the
+  // contact matcher already uses, so both forms reach the same phone.
+  resolveEntry(number) {
+    const clean = String(number || '').trim();
+    const direct = this.entryFor(clean);
+    if (direct) return { entry: direct, number: clean };
+
+    const digits = clean.replace(/\D/g, '');
+    if (digits.length >= 9) {
+      const suffix = digits.slice(-9);
+      for (const key of this.registry.keys()) {
+        const d = String(key).replace(/\D/g, '');
+        if (d.length >= 9 && d.slice(-9) === suffix) {
+          return { entry: this.entryFor(key), number: String(key) };
+        }
+      }
+    }
+    return { entry: null, number: '' };
+  }
+
+  // Attempts still ringing, so a "call-cancel" can find the callee even if the
+  // caller sends only the attempt id. Bounded and pruned: a Worker restart
+  // simply loses them, and the invite's own expiry covers that case.
+  rememberAttempt(attempt, to, expiresAt) {
+    if (!attempt) return;
+    this.pending.set(attempt, { to, expiresAt });
+    const now = Date.now();
+    for (const [id, p] of this.pending) if (p.expiresAt < now) this.pending.delete(id);
+    while (this.pending.size > 200) this.pending.delete(this.pending.keys().next().value);
   }
 
   // ------------------------------------------------------------------ ws io
@@ -154,7 +221,10 @@ export class Hub {
       }
       await this.loadRegistry();
       this.registry.set(number, { token, name, ts: Date.now() });
-      this.persistRegistry();
+      // The ack must come after the write: the app treats "registered" as proof
+      // it is reachable by push, so a lost write would leave a number that looks
+      // online forever while every incoming call to it fails.
+      await this.persistRegistry();
       meta.number = number;
       meta.name = name;
       console.log(`REGISTER ${number}${name ? ' (' + name + ')' : ''} (registry size ${this.registry.size})`);
@@ -244,7 +314,7 @@ export class Hub {
       const to = String(msg.to || '').trim();
       if (!to) return this.send(ws, { type: 'call-failed', message: 'to is required' });
       await this.loadRegistry();
-      const entry = this.entryFor(to);
+      const { entry, number } = this.resolveEntry(to);
       if (!entry || !entry.token) {
         console.log(`CALL ${from} -> ${to}: not registered`);
         return this.send(ws, { type: 'call-unavailable', to });
@@ -253,20 +323,61 @@ export class Hub {
         console.log(`CALL ${from} -> ${to}: FCM secret missing`);
         return this.send(ws, { type: 'call-failed', to, reason: 'fcm-disabled' });
       }
+      // Short lifetime on purpose: the caller gives up at 45s, and an invite
+      // delivered after that makes the callee ring for a call that no longer
+      // exists. The app also drops the invite past this timestamp. Clamped at
+      // both ends because a phone with a skewed clock must not kill its own call.
+      const nowMs = Date.now();
+      const wanted = Number(msg.expiresAt) || nowMs + INVITE_MAX_LIFETIME_MS;
+      const expiresAt = Math.min(Math.max(wanted, nowMs + 5000), nowMs + INVITE_MAX_LIFETIME_MS);
+      const attempt = String(msg.attempt || '').trim() ||
+        `${from || 'call'}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      this.rememberAttempt(attempt, number, expiresAt);
       try {
-        await this.pushCallInvite(entry.token, from, to, this.entryFor(from)?.name || '');
-        console.log(`CALL ${from} -> ${to}: push sent`);
-        return this.send(ws, { type: 'call-ringing', to });
+        await this.pushCallInvite(entry.token, from, number, this.entryFor(from)?.name || '', {
+          attempt,
+          expiresAt,
+        });
+        console.log(`CALL ${from} -> ${number}: push sent`);
+        return this.send(ws, { type: 'call-ringing', to, callee: number, attempt });
       } catch (e) {
         const detail = String(e && e.message ? e.message : e);
-        // A dead token should not stay in the registry forever.
-        if (/REGISTRATION_TOKEN_NOT_REGISTERED|registration-token-not-registered|UNREGISTERED/i.test(detail)) {
-          this.registry.delete(to);
+        // A dead token must not stay in the registry: FCM would keep reporting
+        // success while the phone never rings, which looks exactly like a call
+        // that only works one way. v1 words this as "Registration token is not
+        // registered" or the canonical UNREGISTERED code; legacy wording matches too.
+        if (/UNREGISTERED|NOT\s+REGISTERED|SENDER_ID_MISMATCH/i.test(detail)) {
+          this.registry.delete(number);
           this.persistRegistry();
+          console.log(`CALL ${from} -> ${number}: dead token removed from registry`);
         }
-        console.error(`CALL ${from} -> ${to}: push failed`, detail);
+        console.error(`CALL ${from} -> ${number}: push failed`, detail);
         return this.send(ws, { type: 'call-failed', to, reason: detail });
       }
+    }
+
+    // --- caller hung up: stop a ringing invite before the user answers ----
+    if (msg.type === 'call-cancel') {
+      const attempt = String(msg.attempt || '').trim();
+      const to = String(msg.to || msg.room || '').trim();
+      await this.loadRegistry();
+      let target = attempt ? this.pending.get(attempt) : null;
+      if (!target && to) {
+        const r = this.resolveEntry(to);
+        if (r.entry) target = { to: r.number, expiresAt: 0 };
+      }
+      if (!target) return;
+      this.pending.delete(attempt);
+      const entry = this.entryFor(target.to);
+      if (entry && entry.token && this.env.FCM_SA) {
+        this.pushCallCancel(entry.token, attempt).catch((e) => {
+          console.error('CALL-CANCEL push failed', String(e && e.message ? e.message : e));
+        });
+      }
+      // Also reach an app already connected to that mailbox room (it is on the
+      // screen and ringing there), then clean up the socket's room state.
+      this.broadcast(target.to, ws, { type: 'call-cancel', attempt });
+      return;
     }
 
     // --- room join (live relay) -------------------------------------------
@@ -283,28 +394,16 @@ export class Hub {
       meta.room = room;
       if (!this.rooms.has(room)) this.rooms.set(room, new Set());
       const peers = this.rooms.get(room);
-      this.send(ws, { type: 'joined', peers: peers.size });
-      for (const peer of peers) this.send(peer, { type: 'peer-joined' });
+      const existingPeers = Array.from(peers);
       peers.add(ws);
+      // Add the new socket BEFORE notifying peers. This removes the E2EE
+      // handshake race where the first peer could send its public key after
+      // receiving peer-joined but before the new socket had entered the room.
+      this.send(ws, { type: 'joined', peers: existingPeers.length });
+      for (const peer of existingPeers) this.send(peer, { type: 'peer-joined' });
+      // Give the joining peer the existing peers' keys/signals through normal
+      // room traffic; each existing peer re-announces its E2EE key on peer-joined.
       return;
-    }
-
-    // --- server-side translation fallback ---------------------------------
-    // On-device ML Kit models cannot download on some networks (or on
-    // devices without Play services). The call socket is already connected
-    // here, so translate server-side and answer on the same socket: the
-    // call keeps translating on ANY network, no phone setup required.
-    if (msg.type === 'translate-req') {
-      const text = String(msg.text || '').slice(0, 2000);
-      const from = String(msg.from || 'auto');
-      const to = String(msg.to || 'en');
-      const rid = String(msg.rid || '');
-      if (!text.trim()) {
-        return this.send(ws, { type: 'translate-res', rid, ok: false, text: '' });
-      }
-      const out = await cloudTranslate(text, from, to);
-      console.log(`TRANSLATE ${from}->${to} rid=${rid} ok=${!!out}`);
-      return this.send(ws, { type: 'translate-res', rid, ok: !!out, text: out || '' });
     }
 
     // --- everything else is relayed inside the room -----------------------
@@ -356,7 +455,8 @@ export class Hub {
     return this.accessToken.value;
   }
 
-  async pushCallInvite(token, from, to, fromName) {
+  // Shared FCM HTTP v1 sender: one message envelope, cached access token.
+  async sendMessage(message) {
     const sa = JSON.parse(this.env.FCM_SA);
     const accessToken = await this.getAccessToken(sa);
     const res = await fetch(
@@ -367,66 +467,48 @@ export class Hub {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${accessToken}`,
         },
-        body: JSON.stringify({
-          message: {
-            token,
-            // "from"/"to" are reserved FCM envelope keys: putting them inside
-            // data makes messages:send reject the payload with 400
-            // INVALID_ARGUMENT "Invalid data payload key: from".
-            data: {
-              type: 'call-invite',
-              caller: String(from || ''),
-              callee: String(to || ''),
-              name: String(fromName || ''),
-              ts: String(Date.now()),
-            },
-            android: { priority: 'high', ttl: '60s' },
-          },
-        }),
+        body: JSON.stringify({ message }),
       }
     );
     if (!res.ok) throw new Error(`FCM send failed: ${res.status} ${await res.text()}`);
     return true;
   }
-}
 
-// Server-side translation for phones that cannot run ML Kit on-device
-// (model download blocked by the network, no Play services, ...). Tries
-// Google's public translate endpoint first, then the free MyMemory API.
-async function cloudTranslate(text, from, to) {
-  try {
-    const url =
-      'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t' +
-      '&sl=' + encodeURIComponent(from) +
-      '&tl=' + encodeURIComponent(to) +
-      '&q=' + encodeURIComponent(text);
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 14)' },
+  async pushCallInvite(token, from, to, fromName, invite = {}) {
+    const now = Date.now();
+    const expiresAt = Number(invite.expiresAt) || now + INVITE_MAX_LIFETIME_MS;
+    const ttlSeconds = Math.max(5, Math.round((expiresAt - now) / 1000));
+    await this.sendMessage({
+      token,
+      // "from"/"to" are reserved FCM envelope keys: putting them inside
+      // data makes messages:send reject the payload with 400
+      // INVALID_ARGUMENT "Invalid data payload key: from".
+      data: {
+        type: 'call-invite',
+        caller: String(from || ''),
+        callee: String(to || ''),
+        name: String(fromName || ''),
+        ts: String(now),
+        expires: String(expiresAt),
+        attempt: String(invite.attempt || ''),
+      },
+      // ttl == remaining lifetime, so FCM itself discards an invite that would
+      // land after the caller already gave up.
+      android: { priority: 'high', ttl: `${ttlSeconds}s` },
     });
-    if (res.ok) {
-      const j = await res.json();
-      const segs = Array.isArray(j) && Array.isArray(j[0]) ? j[0] : [];
-      const out = segs
-        .map((s) => (Array.isArray(s) ? s[0] : ''))
-        .filter(Boolean)
-        .join('');
-      if (out.trim()) return out;
-    }
-  } catch (e) {
-    console.error('cloudTranslate gtx failed', e && e.message);
+    return true;
   }
-  try {
-    const res = await fetch(
-      'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) +
-        '&langpair=' + encodeURIComponent(from + '|' + to)
-    );
-    if (res.ok) {
-      const j = await res.json();
-      const out = j && j.responseData && j.responseData.translatedText;
-      if (typeof out === 'string' && out.trim()) return out;
-    }
-  } catch (e) {
-    console.error('cloudTranslate mymemory failed', e && e.message);
+
+  async pushCallCancel(token, attempt) {
+    await this.sendMessage({
+      token,
+      data: {
+        type: 'call-cancel',
+        attempt: String(attempt || ''),
+        ts: String(Date.now()),
+      },
+      android: { priority: 'high', ttl: '30s' },
+    });
+    return true;
   }
-  return '';
 }
